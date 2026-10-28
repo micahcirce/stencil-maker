@@ -26,6 +26,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="stencil-tests-")
     subprocess.run([PY, os.path.join(HERE, "make_test_images.py"), tmp], check=True, capture_output=True)
     isl, face = os.path.join(tmp, "islands.png"), os.path.join(tmp, "face.png")
+    edge, subj = os.path.join(tmp, "edge.png"), os.path.join(tmp, "subject.png")
     paints = os.path.join(HERE, "..", "examples", "example_paints.csv")
     cases = [
         ("single, bridged", [isl, "--set", "mode=single", "--set", "width_mm=250"],
@@ -51,6 +52,22 @@ def main():
                                          "--set", "keepout=[[120,110,190,170]]",
                                          "--set", 'extra_bridges=[{"layer":1,"at":[230,135],"angle_deg":0}]'],
          lambda r: any(b["source"] == "extra" and "note" in b for b in r["layers"][0]["bridges"])),
+        ("edge-touching paint (contour regression)", [edge, "--set", "mode=single", "--set", "width_mm=200"],
+         lambda r: r["layers"][0]["vector_vs_pixel_area_diff"] < 0.01
+                   and len(r["layers"][0]["bridges"]) >= 3),
+        ("crop to subject", [subj, "--set", 'crop="subject"', "--set", "n_layers=2", "--set", "width_mm=150"],
+         lambda r: r["image"]["used_px"][0] < 400 and r["image"]["crop_px"][0] > 200),
+        ("layer colors + opacity", [face, "--set", "n_colors=4", "--set", 'layer_colors={"1":"#3a7bd5"}',
+                                    "--set", "layer_opacity=[100,50,25]", "--set", 'surface_color="#ddd5c4"'],
+         lambda r: r["layers"][0]["color"] == "#3a7bd5" and r["layers"][2]["opacity"] == 25
+                   and r["layers"][0]["cluster_color"] != "#3a7bd5"),
+        ("scale 50% (aspect locked)", [isl, "--set", "mode=single", "--set", "scale=50"],
+         lambda r: abs(r["design_mm"][0] - 158.75) < 0.1 and r["size"]["aspect_stretch"] == 1.0),
+        ("stretch 10x10in (aspect unlocked)", [isl, "--set", "mode=single", "--set", 'width="10in"',
+                                               "--set", 'height="10in"', "--set", "lock_aspect=false"],
+         lambda r: abs(r["design_mm"][1] - 254.0) < 0.2 and abs(r["size"]["aspect_stretch"] - 1.5) < 0.01),
+        ("locked 10x10in box", [isl, "--set", "mode=single", "--set", 'width="10in"', "--set", 'height="10in"'],
+         lambda r: abs(r["design_mm"][0] - 254.0) < 0.2 and r["size"]["aspect_stretch"] == 1.0),
     ]
     failed = 0
     for name, args, check in cases:
@@ -62,6 +79,7 @@ def main():
             assert r["ok"], "report ok=false"
             assert vok, "verify failed:\n" + vtxt
             assert check(r), "case check failed"
+            assert os.path.getsize(os.path.join(out, "preview.html")) > 1000, "preview.html missing"
             print(f"PASS  {name}")
         except AssertionError as e:
             failed += 1

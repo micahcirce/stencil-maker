@@ -49,17 +49,19 @@ Put parameters in a JSON file and pass `--params my.json`; `--set key=value` ove
 | `layer_N.svg`, `layer_N.dxf` | one file per stencil layer, mm units, closed paths |
 | `combined.svg`, `combined.dxf` | all layers side by side (cut them all from one sheet) |
 | `stencil_print.pdf` | cover page with 1 in and 50 mm calibration squares, then each layer at true scale, tiled or fit to one page |
+| `preview.html` | **interactive**: per-layer color picker, opacity slider (default 100 %), show/hide, surface color, single-stencil views, load a paint chart CSV in the browser, "Copy settings" → JSON for `--params` |
 | `preview.png` | every layer with bridge IDs (red), floating islands (blue I1…), problems (magenta), and a simulated painted result |
+| `cutout.png` | background removal only: the subject over magenta, to check nothing important was removed |
 | `report.json` | measured checks, `"ok": true/false`, sizes in in/mm/px, bridges, warnings |
 | `params_used.json` | every effective parameter; re-run with `--params` to reproduce exactly |
 | `options.png`, `analysis.json` | `--analyze` only: color-count options with error and island estimates |
 
-**LightBurn:** each SVG stroke color imports as its own layer:
-- layer cuts: 00 black, 01 blue, 02 red, 03 green, 04 yellow, 05 orange
-- registration marks: 06 cyan
-- sheet border: 07 magenta
+**LightBurn:** strokes use LightBurn's exact default palette, because LightBurn assigns imported shapes to layers by exact color match:
+- paint layers: layers 00–27, so up to **28 paint layers**
+- registration marks: layer 28 (`#86FA88`)
+- sheet border: layer 29 (`#FFDB66`)
 
-Geometry is at true size; set kerf offset in LightBurn per material.
+T1/T2 are LightBurn tool layers that don't cut, so they're not used. Geometry is at true size; set kerf offset in LightBurn per material. ([palette reference](https://docs.lightburnsoftware.com/LayerColors.html))
 
 ## Main parameters
 
@@ -73,10 +75,14 @@ Geometry is at true size; set kerf offset in LightBurn per material.
 - `layering`: `stacked` (default; each layer also cuts every color above it, so later layers cover misregistration and many bridges) or `exact`
 - `layer_order`: `auto` (fewest islands, with a penalty for light paint over dark), `light_to_dark` or a list of colors
 
-**Size** (pick one)
+**Size and scale** (later ones override earlier ones)
 - `width_mm`
-- `width` and/or `height` with units: `"10in"`, `"10 1/2in"`, `"254mm"`, `"25.4cm"`, `"1200px"` (converted using `dpi`, default 96). Giving both fits the design inside that box.
-- `fit` to a paper or material sheet:
+- `scale`: % of the source image at `dpi`, e.g. `50`. Use `[x%, y%]` to scale the axes separately (aspect unlocked).
+- `width` and/or `height` with units: `"10in"`, `"10 1/2in"`, `"254mm"`, `"25.4cm"`, `"1200px"` (converted using `dpi`, default 96)
+  - With both, `lock_aspect: true` (default) fits the design inside that box.
+  - `lock_aspect: false` stretches it to exactly that size.
+- `report.json` → `size.aspect_stretch` shows the distortion (1.0 = none).
+- `fit` to a paper or material sheet (with `lock_aspect: false` it stretches to fill):
   - US paper: `letter`, `legal`, `tabloid`/`ledger`, `arch-a` … `arch-d`
   - ISO paper: `a5` … `a0`, `b4`, `b3`
   - material sheet: e.g. `"12x24in"` or `"300x600mm"`
@@ -104,16 +110,25 @@ Geometry is at true size; set kerf offset in LightBurn per material.
 - `extra_bridges`: `[{"layer": 1, "at": [x, y], "angle_deg": 90, "width_mm": 2}]`
 
 **Image prep**
-- `crop`: `[x0,y0,x1,y1]` in pixels, or fractions 0–1
+- `crop`: `[x0,y0,x1,y1]` in pixels, or fractions 0–1, or `"subject"` to trim to the subject after background removal (or on a transparent PNG); `crop_pad` sets the margin
 - `remove_background` (needs rembg)
+  - `bg_model`: default `isnet-general-use`, which kept pale fur that `u2net` dropped in testing
+  - `alpha_threshold`: 0–255; lower keeps wispy edges
+  - `bg_fill_holes`: fills holes enclosed by the subject
+  - `bg_grow_mm`: + grows, − shrinks the subject outline
+  - check `cutout.png` every time
 - `denoise`
 - `smooth_mm`
 - `min_area_mm2`, `min_island_mm2`: detail floor
 
-**Paint**
-- `paint_chart`: a CSV of `name,hex[,brand]`; reports the nearest paint per layer
+**Display colors and paint** (previews, PDF swatches and the report only; they never change the cut)
+- `layer_colors`: `["#hex", …]` in layer order, or `{"2": "#hex"}`
+- `layer_opacity`: `[100, 60, …]` or `{"3": 40}`, in %, default 100
+- `surface_color`: the wall or substrate under the paint
+- `paint_chart`: a CSV of `name,hex[,brand]`; reports the nearest paint per layer (ΔE76). It can also be loaded later inside `preview.html`.
 - `snap_to_paint`: recolors the layers to those paints
 - `examples/example_paints.csv` shows the format and is **not** real brand data
+- `palette` is different: it forces the *separation* onto exact colors, so it changes the cut
 
 Full list with defaults: the `DEFAULTS` block at the top of `scripts/stencil.py`.
 
@@ -126,7 +141,7 @@ Full list with defaults: the `DEFAULTS` block at the top of `scripts/stencil.py`
 
 ## Known limits
 - **Color separation is k-means posterization.** It works well on flat art and clean AI illustrations, and poorly on busy photos (expect many bridges).
-- **Background removal can drop white or pale parts of the subject**, such as fur or highlights. Check the preview.
+- **Background removal can still drop pale parts of the subject.** Check `cutout.png`.
 - **Bridges are straight.** There's no curved bridge, and no "split island across two layers" mode yet.
 - **Paths are polylines,** not Béziers.
 - **No built-in paint-brand charts.** Screen colors only approximate real paint, so bring your own chart.
@@ -138,11 +153,33 @@ Full list with defaults: the `DEFAULTS` block at the top of `scripts/stencil.py`
 | Choose layer count | yes (`n_colors` / `n_layers`, plus auto proposal) |
 | Background remover | yes, optional (`remove_background`) |
 | Color or greyscale output | yes (`color_mode`) |
-| Paint-brand matching | mechanism yes (`paint_chart`); no bundled brand data |
+| Paint-brand matching | yes, with your chart (`paint_chart`, or load it in `preview.html`); no bundled brand data |
+| Change layer colors live | yes: `preview.html` color pickers and opacity sliders |
 | Adjustable registration marks | size only (`reg_size_mm`) |
-| Real-time sliders / editor | no; would be a UI on top of this engine |
-| Up to 20 layers | max 6 paint layers (LightBurn color mapping) |
+| Real-time geometry sliders | no: color and opacity are live, but geometry changes need a re-run |
+| Up to 20 layers | up to 28 paint layers (LightBurn layers 00–27) |
 | Cutting service, gallery, marketplace | out of scope |
+
+## Self-checks (why `"ok": true` means something)
+- **Connectivity:** every layer is one piece, apart from islands you deliberately left floating.
+- **Width:** no material is thinner than the minimum.
+- **Vector check:** the vector cut area matches the pixel mask within 3% (`vector_vs_pixel_area_diff`). This catches geometry bugs the other checks can't. It found one in v0.2, where paint touching the image edge came out inside-out.
+- **File check:** `verify.py` re-reads the files from disk.
+- **Repeatability:** re-running from `params_used.json` must give byte-identical SVG/DXF; the test suite checks this.
+
+## Changelog
+- **0.3.0**
+  - Full LightBurn palette: 28 paint layers, with registration marks and border on layers 28/29.
+  - Interactive `preview.html`: colors, opacity, paint chart.
+  - `layer_colors`, `layer_opacity`, `surface_color`.
+  - `scale` and `lock_aspect`.
+  - `crop="subject"`.
+  - Better background removal: isnet model, hole fill, grow/shrink, `cutout.png`.
+  - **Fixed:** paint touching the image edge could be vectorized inside-out. Added the vector-vs-pixel self-check and a regression test.
+- **0.2.0**
+  - Automatic color-count proposal, paper fit, imperial/metric/px sizing, bridge on/off switches, grayscale, crop, background removal, paint chart.
+- **0.1.0**
+  - First version.
 
 ## License
 MIT

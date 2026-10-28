@@ -17,8 +17,8 @@ Analyze mode (proposes a color count, makes nothing to cut):
 Usage:
   python stencil.py IMAGE --out DIR [--params params.json] [--set key=value ...]
 """
-__version__ = "0.2.0"
-import argparse, json, math, os, sys
+__version__ = "0.3.0"
+import argparse, json, math, os, re, sys
 import numpy as np
 import cv2
 from PIL import Image, ImageDraw, ImageFont
@@ -44,16 +44,26 @@ DEFAULTS = dict(
     max_auto_colors=7,        # auto: largest color count considered
     delta_e_target=6.0,       # auto: stop adding colors once mean color error (dE76) is below this
     color_mode="color",       # "color" | "gray" (posterize by lightness only, layers are grays)
-    palette=None,             # multi: list of hex colors to snap to instead of k-means
+    palette=None,             # multi: list of hex colors to snap to instead of k-means (changes the cut)
+    # ---- display colors (preview / PDF / report only - never change the cut geometry)
+    layer_colors=None,        # ["#hex", ...] in layer order, or {"2": "#hex"}: paint color you plan to use
+    layer_opacity=None,       # [100, 80, ...] or {"2": 60}: % opacity in the painted preview (default 100)
+    surface_color="#ffffff",  # wall / substrate color under the paint in previews
     paint_chart=None,         # CSV "name,hex[,brand]": report nearest paint per layer
     snap_to_paint=False,      # with paint_chart: use the paint's color as the layer color
     # ---- image prep
-    crop=None,                # [x0,y0,x1,y1] in pixels, or fractions 0-1 of the image
-    remove_background=False,  # AI subject cut-out (rembg; ~176 MB model downloaded on first use)
-    bg_model="u2net",
-    # ---- size (pick one way; later ones win): width_mm | width/height with units | fit
+    crop=None,                # [x0,y0,x1,y1] in pixels, or fractions 0-1, or "subject" (after bg removal)
+    crop_pad=0.03,            # crop="subject": padding as a fraction of the subject size
+    remove_background=False,  # AI subject cut-out (rembg; model downloaded on first use)
+    bg_model="isnet-general-use",  # rembg model; "u2net" is the older default (lost pale fur in tests)
+    alpha_threshold=128,      # 0-255: pixels at least this opaque count as subject (lower keeps wispy edges)
+    bg_fill_holes=True,       # bg removal: fill transparent holes fully enclosed by the subject
+    bg_grow_mm=0.0,           # bg removal: grow (+) or shrink (-) the subject outline
+    # ---- size (pick one way; later ones win): width_mm | scale | width/height with units | fit
     width=None,               # "10in", "10 1/2in", "254mm", "25.4cm", "1200px"
-    height=None,              # same units; with width too, the design fits inside the box
+    height=None,              # same units; with width too: fit inside the box (or stretch, see lock_aspect)
+    lock_aspect=True,         # False + width & height (or fit): stretch to exactly that size
+    scale=None,               # % of source size at dpi: 50, or [x%, y%] to scale axes separately
     dpi=96.0,                 # converts px sizes (96 = LightBurn / Inkscape / CSS default)
     fit=None,                 # paper name ("letter", "a4", ...) or "12x24in" sheet: fit to one sheet
     orientation="auto",       # fit: "auto" | "portrait" | "landscape"
@@ -103,11 +113,20 @@ PAPER = {
     "a5": (148.0, 210.0), "a4": (210.0, 297.0), "a3": (297.0, 420.0), "a2": (420.0, 594.0),
     "a1": (594.0, 841.0), "a0": (841.0, 1189.0), "b4": (250.0, 353.0), "b3": (353.0, 500.0),
 }
-# LightBurn layer palette (00-07). Layers get these stroke colors; reg marks and border their own.
-LB_COLORS = ["#000000", "#0000FF", "#FF0000", "#00E000", "#D0D000", "#FF8000", "#00E0E0", "#FF00FF"]
-REG_COLOR, BORDER_COLOR = "#00E0E0", "#FF00FF"   # LightBurn 06 / 07
-MAX_CUT_LAYERS = 6
-ACI = [7, 5, 1, 3, 2, 30, 4, 6]                  # DXF color index equivalents
+# LightBurn default layer palette 00-29 (docs.lightburnsoftware.com/LayerColors). LightBurn assigns
+# imported shapes to layers by EXACT color match, so only these values are used.
+LB_COLORS = ["#000000", "#0000FF", "#FF0000", "#00E000", "#D0D000", "#FF8000", "#00E0E0", "#FF00FF",
+             "#B4B4B4", "#0000A0", "#A00000", "#00A000", "#A0A000", "#C08000", "#00A0FF", "#A000A0",
+             "#808080", "#7D87B9", "#BB7784", "#4A6FE3", "#D33F6A", "#8CD78C", "#F0B98D", "#F6C4E1",
+             "#FA9ED4", "#500A78", "#B45A00", "#004754", "#86FA88", "#FFDB66"]
+REG_LB, BORDER_LB = 28, 29                       # registration marks / sheet border layers
+REG_COLOR, BORDER_COLOR = LB_COLORS[REG_LB], LB_COLORS[BORDER_LB]
+MAX_CUT_LAYERS = 28                              # LightBurn layers 00-27 for paint layers
+
+def aci(i):
+    """DXF color index for cut layer i (distinct, readable); reg = 4 (cyan), border = 6 (magenta)."""
+    base = [7, 5, 1, 3, 2, 30, 8, 9]
+    return base[i] if i < len(base) else 10 + (i - len(base)) * 10 % 240
 
 
 def load_cfg(args):
@@ -166,16 +185,33 @@ def parse_sheet(s, dpi):
     u = m.group(3) or "mm"
     return (parse_length(m.group(1) + u, dpi), parse_length(m.group(2) + u, dpi)), False
 
-def resolve_size(cfg, aspect):
-    """Set cfg['width_mm'] (design width) from width/height/fit. aspect = image h / w."""
+def resolve_size(cfg, aspect, src_px=None):
+    """Set cfg['width_mm'] and cfg['height_mm'] (design size). aspect = image h / w.
+    Priority: width_mm < scale < width/height < fit. lock_aspect=False lets width+height
+    (or fit) stretch the image; scale=[x%, y%] scales the axes separately."""
     dpi, M = cfg["dpi"], cfg["margin_mm"]
     how = "width_mm"
+    cfg["height_mm"] = None
+    lock = bool(cfg["lock_aspect"])
+    if cfg["scale"] is not None:
+        if src_px is None:
+            sys.exit("scale needs the source image size")
+        sx, sy = (cfg["scale"], cfg["scale"]) if isinstance(cfg["scale"], (int, float)) else cfg["scale"]
+        cfg["width_mm"] = src_px[0] / dpi * 25.4 * sx / 100.0
+        if sx != sy:
+            cfg["height_mm"] = src_px[1] / dpi * 25.4 * sy / 100.0
+        how = f"scale {sx}% x {sy}% of {src_px[0]}x{src_px[1]} px at {dpi:g} dpi"
     if cfg["width"] is not None or cfg["height"] is not None:
         w = parse_length(cfg["width"], dpi) if cfg["width"] is not None else None
         h = parse_length(cfg["height"], dpi) if cfg["height"] is not None else None
+        cfg["height_mm"] = None
         if w and h:
-            cfg["width_mm"] = min(w, h / aspect)
-            how = "fit inside width x height"
+            if lock:
+                cfg["width_mm"] = min(w, h / aspect)
+                how = "fit inside width x height (aspect locked)"
+            else:
+                cfg["width_mm"], cfg["height_mm"] = w, h
+                how = "width x height (stretched, aspect unlocked)"
         else:
             cfg["width_mm"] = w if w else h / aspect
             how = "width" if w else "height"
@@ -190,18 +226,25 @@ def resolve_size(cfg, aspect):
             aw, ah = W - 2 * pm - extra, H - 2 * pm - extra
             if aw <= 0 or ah <= 0:
                 continue
-            dw = min(aw, ah / aspect)
-            if best is None or dw * dw * aspect > best[0] * best[0] * aspect:
-                best = (dw, o)
+            if lock:
+                dw = min(aw, ah / aspect)
+                cand = (dw * dw * aspect, dw, None, o)
+            else:                                    # stretch to fill; pick orientation closest to image shape
+                cand = (-abs(math.log((ah / aw) / aspect)), aw, ah, o)
+            if best is None or cand[0] > best[0]:
+                best = cand
         if best is None:
             sys.exit(f"margin_mm {M} does not fit on {cfg['fit']}; lower margin_mm")
-        cfg["width_mm"], cfg["_fit_orientation"] = best
-        how = f"fit to {cfg['fit']} ({best[1]})"
+        _, cfg["width_mm"], cfg["height_mm"], o = best
+        cfg["_fit_orientation"] = o
+        how = f"fit to {cfg['fit']} ({o}{', stretched' if not lock else ''})"
         if is_paper and cfg["pdf_page"] == "auto":
             cfg["pdf_page"] = str(cfg["fit"]).lower()
     if cfg["pdf_page"] == "auto":
         cfg["pdf_page"] = "letter"
     cfg["_size_from"] = how
+    h_final = cfg["height_mm"] or cfg["width_mm"] * aspect
+    cfg["_stretch"] = round((h_final / cfg["width_mm"]) / aspect, 4)   # 1.0 = undistorted
 
 def fmt_len(mm, dpi=96.0):
     """mm -> '9 13/16 in / 250.0 mm / 945 px@96dpi' (inches to nearest 1/16)."""
@@ -227,16 +270,21 @@ def rgb2hex(c):
 def to_lab(rgb):
     return cv2.cvtColor(rgb.reshape(-1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
 
-def prep_image(path, cfg):
-    """Open, crop, optionally cut out the subject. Returns RGBA PIL image."""
+def prep_image(path, cfg, out_dir=None):
+    """Open, crop, optionally cut out the subject. Returns RGBA PIL image.
+    Writes cutout.png (subject over magenta) when the background is removed, for review."""
     im = Image.open(path)
     im = im.convert("RGBA")
-    if cfg["crop"]:
-        x0, y0, x1, y1 = cfg["crop"]
-        if max(cfg["crop"]) <= 1.0:
+    info = dict(source_px=[im.width, im.height])
+    crop = cfg["crop"]
+    if crop and crop != "subject":
+        x0, y0, x1, y1 = crop
+        if max(crop) <= 1.0:
             x0, x1 = x0 * im.width, x1 * im.width
             y0, y1 = y0 * im.height, y1 * im.height
-        im = im.crop((int(x0), int(y0), int(x1), int(y1)))
+        box_px = (int(x0), int(y0), int(x1), int(y1))
+        im = im.crop(box_px)
+        info["crop_px"] = list(box_px)
     if cfg["remove_background"]:
         try:
             from rembg import remove, new_session
@@ -244,21 +292,54 @@ def prep_image(path, cfg):
             sys.exit("remove_background needs: pip install --break-system-packages 'rembg[cpu]'")
         cut = remove(im.convert("RGB"), session=new_session(cfg["bg_model"]))
         a = np.minimum(np.asarray(cut)[..., 3], np.asarray(im)[..., 3])
+        keep = a >= cfg["alpha_threshold"]
+        if cfg["bg_fill_holes"]:
+            from scipy.ndimage import binary_fill_holes
+            filled = binary_fill_holes(keep)
+            info["holes_filled_px"] = int((filled & ~keep).sum())
+            keep = filled
+        a = np.where(keep, 255, 0).astype(np.uint8)
         im = Image.fromarray(np.dstack([np.asarray(im)[..., :3], a]).astype(np.uint8), "RGBA")
+        info["subject_share"] = round(float(keep.mean()), 3)
+        info["bg_model"] = cfg["bg_model"]
         if cfg["background"] == "auto":
             cfg["background"] = "none"        # transparent area is the background now
+        if out_dir:
+            rev = Image.new("RGB", im.size, (255, 0, 255))
+            rev.paste(im.convert("RGB"), mask=im.split()[3])
+            rev.save(os.path.join(out_dir, "cutout.png"))
+    if crop == "subject":
+        a = np.asarray(im)[..., 3] >= cfg["alpha_threshold"]
+        if not a.any():
+            sys.exit('crop="subject": nothing opaque to crop to (use with remove_background or a transparent PNG)')
+        ys, xs = np.nonzero(a)
+        pad = int(cfg["crop_pad"] * max(np.ptp(xs) + 1, np.ptp(ys) + 1))
+        box_px = (max(0, xs.min() - pad), max(0, ys.min() - pad),
+                  min(im.width, xs.max() + 1 + pad), min(im.height, ys.max() + 1 + pad))
+        im = im.crop(tuple(int(v) for v in box_px))
+        info["crop_px"] = [int(v) for v in box_px]
+    info["used_px"] = [im.width, im.height]
+    cfg["_image_info"] = info
     return im
 
 def load_image(im, cfg):
+    """Resample to the working resolution. Width AND height come from resolve_size, so a
+    non-locked aspect ratio stretches the image here (same px/mm on both axes)."""
     w_px = int(round(cfg["width_mm"] * cfg["px_per_mm"]))
     w_px = min(w_px, 8000)
     cfg["px_per_mm"] = w_px / cfg["width_mm"]
-    h_px = int(round(im.height * w_px / im.width))
+    h_mm = cfg.get("height_mm") or cfg["width_mm"] * im.height / im.width
+    h_px = max(1, int(round(h_mm * cfg["px_per_mm"])))
     im = im.resize((w_px, h_px), Image.LANCZOS)
     arr = np.asarray(im)
     rgb, alpha = arr[..., :3].copy(), arr[..., 3]
-    rgb[alpha < 128] = 255
-    return rgb, alpha >= 128
+    opaque = alpha >= cfg["alpha_threshold"]
+    if cfg["remove_background"] and cfg["bg_grow_mm"]:
+        r = max(1, int(round(abs(cfg["bg_grow_mm"]) * cfg["px_per_mm"])))
+        op = cv2.dilate if cfg["bg_grow_mm"] > 0 else cv2.erode
+        opaque = op(opaque.astype(np.uint8), disk(r)).astype(bool)
+    rgb[~opaque] = 255
+    return rgb, opaque
 
 def true_lab(lab8):
     """OpenCV 8-bit Lab -> CIE L*a*b* (for real delta-E numbers)."""
@@ -324,7 +405,7 @@ def analyze(rgb, opaque, cfg):
             np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]), minlength=len(centers)).argmax())
         paint = [i for i in range(len(centers)) if i != bg and ((labels == i) & op).any()]
         isl = None
-        if 0 < len(paint) <= 5:
+        if 0 < len(paint) <= 8:
             _, info = choose_order(labels, op, paint, centers, sub)
             isl = info["chosen_islands"]
         rows.append(dict(n_colors=k, actual_colors=len(centers), paint_layers=len(paint),
@@ -453,17 +534,31 @@ def choose_order(labels, opaque, paint_ids, centers, cfg):
             cache[key] = count_islands(np.logical_or.reduce([own[i] for i in subset]), min_px)
         return cache[key]
     base = sorted(paint_ids, key=lambda i: -centers[i][0])
-    cands = permutations(paint_ids) if len(paint_ids) <= 5 else [tuple(base)]
     w = cfg["inversion_penalty"]
-    best = None
-    for perm in cands:
+    def evaluate(perm):
         islands = sum(isl(perm[n:]) for n in range(len(perm)))
         inv = sum(1 for a in range(len(perm)) for b in range(a + 1, len(perm))
                   if centers[perm[b]][0] - centers[perm[a]][0] > 20 * 255 / 100)
-        score = islands + w * inv
-        key = (score, [-centers[i][0] for i in perm])
-        if best is None or key < best[0]:
-            best = (key, list(perm), islands, inv)
+        return (islands + w * inv, [-centers[i][0] for i in perm]), islands, inv
+    best = None
+    if len(paint_ids) <= 5:                      # exhaustive
+        for perm in permutations(paint_ids):
+            key, islands, inv = evaluate(perm)
+            if best is None or key < best[0]:
+                best = (key, list(perm), islands, inv)
+    else:                                        # hill-climb from light->dark with pairwise swaps
+        cur = list(base)
+        key, islands, inv = evaluate(cur)
+        best = (key, cur, islands, inv)
+        improved = True
+        while improved:
+            improved = False
+            for a in range(len(cur)):
+                for b in range(a + 1, len(cur)):
+                    cand = list(best[1]); cand[a], cand[b] = cand[b], cand[a]
+                    k2, i2, v2 = evaluate(cand)
+                    if k2 < best[0]:
+                        best, improved = (k2, cand, i2, v2), True
     light_dark = sum(isl(base[n:]) for n in range(len(base)))
     return best[1], dict(chosen_islands=best[2], light_to_dark_islands=light_dark,
                          lighter_over_darker_steps=best[3])
@@ -546,15 +641,19 @@ def clean_mask(mask, cfg):
 # ---------------------------------------------------------------- vectorize
 def vectorize(mask, cfg, design):
     ppm = cfg["px_per_mm"]
-    f = np.pad(mask.astype(np.float32), 1)
     s = cfg["smooth_mm"] * ppm
+    # pad with zeros wider than the blur reach and blur with a CONSTANT (zero) border, so every
+    # contour closes inside the padding; a reflected border leaves edge-touching outlines open,
+    # which flips inside/outside (bug found on a subject touching the image edge)
+    pad = int(math.ceil(3 * s)) + 2 if s > 0 else 1
+    f = np.pad(mask.astype(np.float32), pad)
     if s > 0:
-        f = cv2.GaussianBlur(f, (0, 0), s)
+        f = cv2.GaussianBlur(f, (0, 0), s, borderType=cv2.BORDER_CONSTANT)
     rings = []
     for c in find_contours(f, 0.5):
-        if len(c) < 4:
+        if len(c) < 4 or not np.allclose(c[0], c[-1]):
             continue
-        xy = np.column_stack([(c[:, 1] - 1) / ppm, (c[:, 0] - 1) / ppm])
+        xy = np.column_stack([(c[:, 1] - pad) / ppm, (c[:, 0] - pad) / ppm])
         p = Polygon(xy)
         if not p.is_valid:
             p = p.buffer(0)
@@ -962,7 +1061,7 @@ def raster(g, img, d, s, ox, oy, fill, hole):
         for r in p.interiors:
             d.polygon([(ox + x * s, oy + y * s) for x, y in r.coords], fill=hole)
 
-def write_preview(path, layers, SW, SH, val, off):
+def write_preview(path, layers, SW, SH, val, off, surface="#ffffff"):
     s = min(4.0, 900 / max(SW, SH))
     pw, ph = int(SW * s), int(SH * s)
     n = len(layers) + 1
@@ -998,9 +1097,16 @@ def write_preview(path, layers, SW, SH, val, off):
     r, cl = divmod(len(layers), cols)
     ox, oy = pad + cl * (pw + pad), pad + r * (ph + pad + head) + head
     d.text((ox, oy - head + 4), "Painted result (simulated)", fill="#000000", font=f)
-    d.rectangle([ox, oy, ox + pw, oy + ph], fill="#ffffff", outline="#000000")
+    sim = Image.new("RGBA", (pw, ph), surface)
     for Ly in layers:
-        raster(Ly["cut"], img, d, s, ox, oy, Ly["color"], "#ffffff")
+        lay = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(lay)
+        a = int(round(255 * Ly.get("opacity", 100) / 100))
+        rgba = tuple(int(Ly["color"][k:k + 2], 16) for k in (1, 3, 5)) + (a,)
+        raster(Ly["cut"], lay, ld, s, 0, 0, rgba, (0, 0, 0, 0))
+        sim = Image.alpha_composite(sim, lay)
+    img.paste(sim.convert("RGB"), (ox, oy))
+    d.rectangle([ox, oy, ox + pw, oy + ph], outline="#000000")
     img.save(path)
 
 # ---------------------------------------------------------------- main
@@ -1028,6 +1134,22 @@ def nearest_paint(hexcol, chart):
             best = (d, p)
     return dict(best[1], delta_e=round(best[0], 1))
 
+def per_layer(v, n, name):
+    """list (layer order) or {"2": value} -> list of length n (None = not set)."""
+    out = [None] * n
+    if v is None:
+        return out
+    if isinstance(v, dict):
+        for k, x in v.items():
+            j = int(k) - 1
+            if not 0 <= j < n:
+                sys.exit(f"{name}: layer {k} does not exist (1-{n})")
+            out[j] = x
+    else:
+        for j, x in enumerate(list(v)[:n]):
+            out[j] = x
+    return out
+
 def public_cfg(cfg):
     keys = list(DEFAULTS) + ["min_bridge_mm", "min_cut_mm", "min_material_mm", "width_mm"]
     out = {k: cfg[k] for k in keys if k in cfg}
@@ -1046,10 +1168,10 @@ def main():
     cfg = load_cfg(args)
     os.makedirs(args.out, exist_ok=True)
 
-    im = prep_image(args.image, cfg)       # may switch background to "none" (cut-out subject)
+    im = prep_image(args.image, cfg, args.out)   # may switch background to "none" (cut-out subject)
     if cfg["n_layers"] is not None:
         cfg["n_colors"] = int(cfg["n_layers"]) + (0 if cfg["background"] == "none" else 1)
-    resolve_size(cfg, im.height / im.width)
+    resolve_size(cfg, im.height / im.width, (im.width, im.height))
     rgb, opaque = load_image(im, cfg)
     if cfg["denoise"]:
         rgb = cv2.bilateralFilter(rgb, 9, 40, 9)
@@ -1092,18 +1214,39 @@ def main():
 
     raw_layers, sep_info = separate(rgb, opaque, dict(cfg, denoise=False))
     chart = load_paint_chart(cfg["paint_chart"]) if cfg["paint_chart"] else None
+    # display colors: cluster color -> (snap to paint) -> explicit layer_colors (user wins)
+    user_cols = per_layer(cfg["layer_colors"], len(raw_layers), "layer_colors")
+    user_op = per_layer(cfg["layer_opacity"], len(raw_layers), "layer_opacity")
     paints = []
-    for L in raw_layers:
-        p = nearest_paint(L["color"], chart) if chart else None
-        paints.append(p)
-        if p and cfg["snap_to_paint"]:
-            L["color"] = p["hex"]
+    for i, L in enumerate(raw_layers):
+        L["cluster_color"] = L["color"]
+        if chart and cfg["snap_to_paint"]:
+            L["color"] = nearest_paint(L["color"], chart)["hex"]
+        if user_cols[i]:
+            c = str(user_cols[i]).strip().lower()
+            if not re.fullmatch(r"#[0-9a-f]{6}", c):
+                sys.exit(f"layer_colors: {user_cols[i]!r} is not #rrggbb")
+            L["color"] = c
+        op = 100 if user_op[i] is None else float(user_op[i])
+        if not 0 <= op <= 100:
+            sys.exit(f"layer_opacity must be 0-100, got {op}")
+        L["opacity"] = op
+        paints.append(nearest_paint(L["color"], chart) if chart else None)
     warnings = []
     cuts = []
     ppm = cfg["px_per_mm"]
     for i, L in enumerate(raw_layers):
         cm = clean_mask(L["mask"], cfg)
-        cuts.append(enforce_minimums(vectorize(cm, cfg, design), cfg, design))
+        vec = vectorize(cm, cfg, design)
+        # self-check: the vector cut must cover about the same area as the pixel mask
+        px_area = float(cm.sum()) / (ppm * ppm)
+        mismatch = abs(vec.area - px_area) / max(px_area, 1.0)
+        L["vector_mismatch"] = round(mismatch, 4)
+        if mismatch > 0.03:
+            warnings.append(dict(layer=i + 1, type="vector_mismatch", mismatch=round(mismatch, 3),
+                                 hint="vector outline area differs from the pixel mask by more than 3% - "
+                                      "geometry is not trustworthy; report this image as a bug"))
+        cuts.append(enforce_minimums(vec, cfg, design))
         # report detail the cleanup threw away (too thin / too small to cut)
         lost = (L["mask"] & ~cm).astype(np.uint8)
         lost = cv2.morphologyEx(lost, cv2.MORPH_OPEN, disk(1))
@@ -1149,7 +1292,8 @@ def main():
             warnings.append(dict(layer=i + 1, type="floating_islands", count=len(v["floating_islands"]),
                                  hint="left unbridged on purpose: cut out, keep, and place by hand "
                                       "(spray adhesive / transfer tape), or turn bridges back on"))
-        out_layers.append(dict(color=L["color"], cut=shapely.affinity.translate(bcut, M, M),
+        out_layers.append(dict(color=L["color"], cluster_color=L["cluster_color"], opacity=L["opacity"],
+                               cut=shapely.affinity.translate(bcut, M, M),
                                reg=shapely.affinity.translate(reg, M, M),
                                bridge_marks=[shapely.affinity.translate(m, M, M) for m in marks],
                                bridges=specs, floating=v["floating_islands"]))
@@ -1161,21 +1305,27 @@ def main():
         write_svg(os.path.join(args.out, f"layer_{i + 1}.svg"), SW, SH,
                   [(f"layer{i + 1}_cut", LB_COLORS[i], cr), ("registration", REG_COLOR, rr), ("border", BORDER_COLOR, border)])
         write_dxf(os.path.join(args.out, f"layer_{i + 1}.dxf"), SH,
-                  [(f"LAYER{i + 1}_CUT", ACI[i], cr), ("REGISTRATION", ACI[6], rr), ("BORDER", ACI[7], border)])
+                  [(f"LAYER{i + 1}_CUT", aci(i), cr), ("REGISTRATION", 4, rr), ("BORDER", 6, border)])
         dx = i * (SW + gap)
         sh = lambda rs: [r + [dx, 0] for r in rs]
         combined_svg += [(f"layer{i + 1}_cut", LB_COLORS[i], sh(cr)), (f"layer{i + 1}_reg", REG_COLOR, sh(rr)),
                          (f"layer{i + 1}_border", BORDER_COLOR, sh(border))]
-        combined_dxf += [(f"LAYER{i + 1}_CUT", ACI[i], sh(cr)), ("REGISTRATION", ACI[6], sh(rr)), ("BORDER", ACI[7], sh(border))]
+        combined_dxf += [(f"LAYER{i + 1}_CUT", aci(i), sh(cr)), ("REGISTRATION", 4, sh(rr)), ("BORDER", 6, sh(border))]
     CW = len(out_layers) * SW + (len(out_layers) - 1) * gap
     write_svg(os.path.join(args.out, "combined.svg"), CW, SH, combined_svg)
     write_dxf(os.path.join(args.out, "combined.dxf"), SH, combined_dxf)
     pages = write_pdf(os.path.join(args.out, "stencil_print.pdf"), out_layers, SW, SH, cfg, M)
-    write_preview(os.path.join(args.out, "preview.png"), out_layers, SW, SH, vals, M)
+    write_preview(os.path.join(args.out, "preview.png"), out_layers, SW, SH, vals, M, cfg["surface_color"])
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from preview_html import write_html
+    write_html(os.path.join(args.out, "preview.html"), out_layers, SW, SH, M, DW, DH,
+               f"Design {fmt_len(DW, cfg['dpi'])} x {fmt_len(DH, cfg['dpi'])}", chart, cfg["surface_color"],
+               title=f"Stencil preview - {os.path.basename(args.image)}")
 
     # structural failures block "ok"; thin cuts only paint poorly, so they are warnings.
     # floating islands are fine only when they were left floating on purpose.
-    ok = all(not v["islands"] and not v["thin_material"] for v in vals)
+    ok = all(not v["islands"] and not v["thin_material"] for v in vals) and \
+        all(L["vector_mismatch"] <= 0.03 for L in raw_layers)
     for i, v in enumerate(vals):
         if v["thin_cut"]:
             warnings.append(dict(layer=i + 1, type="thin_cut", count=len(v["thin_cut"]),
@@ -1185,14 +1335,18 @@ def main():
         ok=ok, version=__version__,
         size=dict(design=f"{fmt_len(DW, cfg['dpi'])}  x  {fmt_len(DH, cfg['dpi'])}",
                   sheet=f"{fmt_len(SW, cfg['dpi'])}  x  {fmt_len(SH, cfg['dpi'])}",
-                  from_=cfg["_size_from"], pdf_page=cfg["pdf_page"]),
+                  from_=cfg["_size_from"], pdf_page=cfg["pdf_page"],
+                  aspect_stretch=cfg["_stretch"]),
+        image=cfg.get("_image_info"),
         sheet_mm=[round(SW, 2), round(SH, 2)], design_mm=[round(DW, 2), round(DH, 2)],
         coordinates="bridge/island/violation x,y are mm from the design (image) top-left; files add margin_mm",
         colors=color_info,
         settings={k: cfg[k] for k in ("profile", "mode", "color_mode", "layering", "min_cut_mm", "min_material_mm",
                                       "bridges", "bridge_layers", "bridge_width_mm", "bridges_per_island", "margin_mm")},
         warnings=warnings, separation=sep_info, pdf_pages_per_layer=pages,
-        layers=[dict(layer=i + 1, color=Ly["color"], lightburn_color=LB_COLORS[i], paint=paints[i],
+        layers=[dict(layer=i + 1, color=Ly["color"], cluster_color=Ly["cluster_color"], opacity=Ly["opacity"],
+                     lightburn_layer=f"{i:02d}", lightburn_color=LB_COLORS[i], paint=paints[i],
+                     vector_vs_pixel_area_diff=raw_layers[i]["vector_mismatch"],
                      bridging=layer_bridging_on(cfg, i + 1),
                      bridges=[{k: (np.round(v, 2).tolist() if k in ("p", "q") else v) for k, v in b.items()} for b in Ly["bridges"]],
                      **vals[i]) for i, Ly in enumerate(out_layers)],

@@ -5,6 +5,8 @@
                an eye, a square frame, and a line too thin to cut
   face.png     five-color flat illustration, blurred + noisy + JPEG-compressed to imitate
                an AI-generated raster (anti-aliased edges, compression blends)
+  edge.png     paint touching every image edge, with holes (open-contour regression)
+  subject.png  transparent PNG with a small centered subject (crop="subject")
 """
 import io, os, sys
 import numpy as np
@@ -47,9 +49,29 @@ def face(path):
     b = io.BytesIO(); im.save(b, "JPEG", quality=55)
     Image.open(b).save(path)
 
+def edge(path):
+    """Paint that touches every image edge, with holes: regression for the open-contour bug."""
+    im = Image.new("RGB", (900, 600), "white")
+    d = ImageDraw.Draw(im)
+    d.rectangle([0, 250, 900, 600], fill="#222222")
+    d.rectangle([0, 0, 120, 600], fill="#222222")
+    for cx in (300, 520, 740):
+        d.ellipse([cx - 50, 380, cx + 50, 480], fill="white")
+    im.save(path)
+
+def subject(path):
+    """Transparent PNG with a centered subject: for crop="subject" without background removal."""
+    im = Image.new("RGBA", (800, 800), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    d.ellipse([250, 300, 550, 600], fill=(40, 40, 40, 255))
+    d.ellipse([340, 390, 460, 510], fill=(240, 240, 240, 255))
+    im.save(path)
+
 if __name__ == "__main__":
     out = sys.argv[1] if len(sys.argv) > 1 else "."
     os.makedirs(out, exist_ok=True)
     islands(os.path.join(out, "islands.png"))
     face(os.path.join(out, "face.png"))
-    print("wrote", os.path.join(out, "islands.png"), os.path.join(out, "face.png"))
+    edge(os.path.join(out, "edge.png"))
+    subject(os.path.join(out, "subject.png"))
+    print("wrote test images to", out)
