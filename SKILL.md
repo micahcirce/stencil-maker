@@ -14,14 +14,15 @@ The geometry comes from a **deterministic engine**: `micahcirce/stencil-maker` o
 **Claude never writes or edits path data by hand.** Claude's output is always parameters.
 
 ## 0. Setup (once per session)
-1. **Get the repo.** It's private, so attach it first if this session doesn't have it: call the add_repo tool with owner `micahcirce` and repo `stencil-maker`, then use the clone command it gives. Otherwise:
+1. **Get the repo.** It's public, so a plain clone works without a login:
    ```bash
    git clone --depth 1 https://github.com/micahcirce/stencil-maker stencil-maker 2>/dev/null || git -C stencil-maker pull -q
    pip install --break-system-packages -q -r stencil-maker/requirements.txt
    ```
-2. **If the clone fails,** say so plainly and ask the person to attach the repo or upload the files. Never rewrite the engine from memory.
-3. **Background removal:** install `rembg[cpu]` only when it's wanted. It downloads a model of about 170 MB on first use.
-4. **Parameter reference:** `stencil-maker/README.md`, and the `DEFAULTS` block at the top of `scripts/stencil.py`.
+2. **If the clone is refused** (for example, the repo was made private), call the add_repo tool with owner `micahcirce` and repo `stencil-maker`, then use the clone command it returns.
+3. **If that fails too,** say so plainly and ask the person to upload the files. Never rewrite the engine from memory.
+4. **Background removal:** install `rembg[cpu]` only when it's wanted. It downloads a model of about 170 MB on first use.
+5. **Parameter reference:** `stencil-maker/README.md`, and the `DEFAULTS` block at the top of `scripts/stencil.py`.
 
 ## 1. Get the inputs (ask only for what's missing, all at once)
 - **The image.**
