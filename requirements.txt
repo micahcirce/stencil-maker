@@ -1,0 +1,10 @@
+numpy
+opencv-python-headless
+pillow
+shapely>=2.0
+scikit-image
+scipy
+ezdxf
+reportlab
+# optional, for remove_background (downloads a ~176 MB model on first use):
+# rembg[cpu]

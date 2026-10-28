@@ -1,0 +1,10 @@
+# EXAMPLE ONLY - generic colors, not a real brand chart. Format: name,hex[,brand]
+# Make your own from a manufacturer's chart; screen hex values only approximate real paint.
+name,hex,brand
+Black,#1a1a1a,example
+White,#f5f5f5,example
+Sun Yellow,#f2b632,example
+Brick Red,#c2452d,example
+Cream,#f1e9d6,example
+Sky Blue,#4a90c8,example
+Leaf Green,#3f8f4a,example
